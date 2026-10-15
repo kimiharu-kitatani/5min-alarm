@@ -28,6 +28,15 @@
   input[type=range] { width:220px; height:32px; accent-color:var(--accent); }
   .vol { font-size:22px; }
   .note { font-size:17px; color:var(--sub); text-align:center; line-height:1.7; }
+  .sec-title { font-size:24px; font-weight:bold; margin-bottom:10px; }
+  .opt { display:flex; align-items:center; gap:10px; justify-content:flex-start; font-size:24px; padding:8px 4px; cursor:pointer; text-align:left; }
+  .opt input { width:26px; height:26px; accent-color:var(--accent); flex:none; }
+  .opt.disabled { color:var(--off); cursor:default; }
+  .fileline { font-size:20px; color:var(--ink); margin:8px 0; word-break:break-all; min-height:1.4em; }
+  .msg { font-size:19px; color:#b45f0b; min-height:1.4em; margin-top:6px; }
+  select { font-size:22px; padding:8px 12px; border-radius:12px; border:2px solid var(--accent); background:#fff; color:var(--ink); font-family:inherit; }
+  .help { font-size:17px; color:var(--sub); line-height:1.7; margin-top:12px; text-align:left; }
+  .help a { color:#b45f0b; }
   .flash { animation:flash .9s ease-out; }
   @keyframes flash { 0%{background:#ffe0a8} 100%{background:var(--card)} }
 </style>
@@ -66,6 +75,30 @@
     </div>
   </div>
 
+  <div class="card" id="soundCard">
+    <div class="sec-title">🎵 音の選択</div>
+    <label class="opt"><input type="radio" name="mode" id="modeBeep" value="beep"> ピピピ（標準）</label>
+    <label class="opt" id="modeCustomLabel"><input type="radio" name="mode" id="modeCustom" value="custom"> 自分の音声ファイル</label>
+    <div class="fileline" id="fileName">ファイルは選ばれていません</div>
+    <div class="row">
+      <button class="sub" id="pick" type="button">📂 ファイルを選ぶ</button>
+      <button class="sub" id="del" type="button">🗑 削除（標準に戻す）</button>
+    </div>
+    <input id="file" type="file" accept="audio/*" hidden>
+    <div class="row" style="margin-top:14px">
+      <label class="vol">鳴らす長さ
+        <select id="len">
+          <option value="1">1秒</option><option value="2">2秒</option><option value="3">3秒</option>
+          <option value="5">5秒</option><option value="10">10秒</option><option value="full">最後まで（最長15秒）</option>
+        </select>
+      </label>
+    </div>
+    <div class="msg" id="soundMsg"></div>
+    <div class="help">効果音ラボなどで好きな音をダウンロードして、ここで選んでください（<a href="https://soundeffect-lab.info/" target="_blank" rel="noopener noreferrer">効果音ラボ</a>）。<br>
+    選んだファイルは、この端末のブラウザの中にだけ保存されます（どこにもアップロードされません）。<br>
+    「鳴らす長さ」は、ピピピ以外の音にだけ使われます。長い音は、その長さで自動的に小さくなって止まります。</div>
+  </div>
+
   <p class="note">ONの間、毎時 0分・5分・10分 … 55分（5分足が更新されるとき）に「ピピピ」と鳴って、自動で止まります。<br>
   このタブを開いたままにしてください（別のタブやウィンドウの裏でも鳴ります）。</p>
 </main>
@@ -84,12 +117,14 @@
   var volEl = $('vol'), volTextEl = $('volText'), testEl = $('test');
 
   // ---- 設定の保存・読み込み ----
-  var settings = { on: false, vol: 80 };
+  var settings = { on: false, vol: 80, mode: 'beep', len: '3' };
   try {
     var saved = JSON.parse(localStorage.getItem(KEY) || 'null');
     if (saved) {
       settings.on = !!saved.on;
       if (typeof saved.vol === 'number' && saved.vol >= 0 && saved.vol <= 100) settings.vol = saved.vol;
+      if (saved.mode === 'custom') settings.mode = 'custom';
+      if (['1','2','3','5','10','full'].indexOf(String(saved.len)) >= 0) settings.len = String(saved.len);
     }
   } catch (e) {}
   function save() { try { localStorage.setItem(KEY, JSON.stringify(settings)); } catch (e) {} }
@@ -135,6 +170,137 @@
     }
   }
 
+  // ---- 自分の音声ファイル（IndexedDB に保存 → Web Audio でデコード）----
+  var DB_NAME = 'alarm5m-db', STORE = 'sounds', SOUND_KEY = 'alarm5m-sound';
+  var MAX_BYTES = 20 * 1024 * 1024, MAX_PLAY_SEC = 15;
+  var soundBuf = null;      // デコード済み AudioBuffer
+  var soundName = '';
+  var soundMsg = '';
+  var soundLoading = false;
+
+  function openDB() {
+    return new Promise(function (resolve, reject) {
+      if (!window.indexedDB) { reject(new Error('no idb')); return; }
+      var r = indexedDB.open(DB_NAME, 1);
+      r.onupgradeneeded = function () { r.result.createObjectStore(STORE); };
+      r.onsuccess = function () { resolve(r.result); };
+      r.onerror = function () { reject(r.error); };
+    });
+  }
+  function idbOp(mode, fn) {
+    return openDB().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var tx = db.transaction(STORE, mode);
+        var req = fn(tx.objectStore(STORE));
+        tx.oncomplete = function () { db.close(); resolve(req ? req.result : undefined); };
+        tx.onerror = tx.onabort = function () { db.close(); reject(tx.error || new Error('idb')); };
+      });
+    });
+  }
+  function idbGet() { return idbOp('readonly', function (st) { return st.get(SOUND_KEY); }); }
+  function idbPut(v) { return idbOp('readwrite', function (st) { return st.put(v, SOUND_KEY); }); }
+  function idbDel() { return idbOp('readwrite', function (st) { return st.delete(SOUND_KEY); }); }
+
+  function decode(arrayBuffer) {
+    var c = getCtx();
+    return new Promise(function (resolve, reject) {
+      if (!c) { reject(new Error('no audio')); return; }
+      try {
+        var p = c.decodeAudioData(arrayBuffer.slice(0), resolve, reject);
+        if (p && p.then) p.then(resolve, reject);
+      } catch (e) { reject(e); }
+    });
+  }
+
+  function loadSavedSound() {
+    soundLoading = true;
+    return idbGet().then(function (rec) {
+      if (!rec || !rec.data) { return null; }
+      return decode(rec.data).then(function (buf) { soundBuf = buf; soundName = rec.name || '音声ファイル'; return buf; });
+    }).catch(function () {
+      soundBuf = null; soundName = '';
+      if (settings.mode === 'custom') soundMsg = '保存した音声を読み込めませんでした。標準のピピピを使います';
+    }).then(function () {
+      soundLoading = false;
+      if (settings.mode === 'custom' && !soundBuf) {
+        if (!soundMsg) soundMsg = '音声ファイルが見つかりません。標準のピピピを使います';
+        settings.mode = 'beep'; save();
+      }
+      refreshUI();
+    });
+  }
+
+  function onFileChosen(file) {
+    if (!file) return;
+    soundMsg = '';
+    if (file.size > MAX_BYTES) { soundMsg = 'ファイルが大きすぎます（20MBまで）。別のファイルを選んでください'; refreshUI(); return; }
+    soundMsg = '読み込み中です…'; refreshUI();
+    var reader = new FileReader();
+    reader.onerror = function () { soundMsg = 'ファイルを読み込めませんでした'; refreshUI(); };
+    reader.onload = function () {
+      var data = reader.result;
+      decode(data).then(function (buf) {
+        soundBuf = buf; soundName = file.name;
+        settings.mode = 'custom'; save();
+        soundMsg = '';
+        return idbPut({ name: file.name, type: file.type, data: data }).then(function () {
+          soundMsg = '「テスト音」ボタンで確認できます';
+        }, function () {
+          soundMsg = 'この環境では保存できませんでした（このページを開いている間だけ使えます）';
+        });
+      }, function () {
+        soundMsg = 'この音声ファイルは使えませんでした。mp3 や wav など別のファイルを選んでください';
+      }).then(refreshUI);
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  function clearSound() {
+    soundBuf = null; soundName = ''; settings.mode = 'beep'; save();
+    soundMsg = '標準のピピピに戻しました';
+    idbDel().catch(function () {}).then(refreshUI);
+  }
+
+  function customDuration(buf) {
+    var cap = settings.len === 'full' ? MAX_PLAY_SEC : parseFloat(settings.len);
+    return Math.max(0.2, Math.min(buf.duration, cap, MAX_PLAY_SEC));
+  }
+
+  // 自分の音声を再生（長い場合は指定の長さで、短い減衰をつけて止める）
+  function scheduleSound(startAt, maxSec) {
+    var c = ctx;
+    var gainValue = Math.pow(settings.vol / 100, 1.5) * 0.9;
+    if (gainValue <= 0) return 0;
+    var dur = customDuration(soundBuf);
+    if (maxSec) dur = Math.min(dur, maxSec);
+    var fade = Math.min(0.3, dur * 0.4);
+    var src = c.createBufferSource();
+    var g = c.createGain();
+    src.buffer = soundBuf;
+    g.gain.setValueAtTime(gainValue, startAt);
+    g.gain.setValueAtTime(gainValue, startAt + dur - fade);
+    g.gain.linearRampToValueAtTime(0.0001, startAt + dur);
+    src.connect(g); g.connect(c.destination);
+    src.start(startAt);
+    src.stop(startAt + dur + 0.02);   // 自動で止まる
+    return dur;
+  }
+
+  // 選択中の音を鳴らす（失敗したら標準のピピピ）
+  function playAlarm(startAt, maxSec) {
+    var info = { kind: 'beep', startAt: startAt, dur: 0 };
+    if (settings.mode === 'custom') {
+      if (soundBuf) {
+        try { info.dur = scheduleSound(startAt, maxSec); info.kind = 'custom'; }
+        catch (e) { soundMsg = '音声を鳴らせなかったため、ピピピにしました'; refreshUI(); }
+      } else {
+        soundMsg = '音声ファイルが使えないため、ピピピにしました'; refreshUI();
+      }
+    }
+    if (info.kind === 'beep') scheduleBeeps(startAt);
+    window.__alarm5m.lastPlay = info;
+  }
+
   // ---- 時刻ユーティリティ（PCのローカル時刻）----
   function pad(n) { return (n < 10 ? '0' : '') + n; }
   function hms(d) { return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()); }
@@ -156,7 +322,7 @@
   window.__alarm5m = { rings: 0, scheduled: 0, log: [] }; // 動作確認用
 
   function ring(boundaryMs, startAt) {
-    scheduleBeeps(startAt);
+    playAlarm(startAt);
     window.__alarm5m.rings++;
     window.__alarm5m.log.push(boundaryMs);
   }
@@ -223,6 +389,18 @@
     else statusEl.textContent = '5分ごとに鳴ります（押すとOFFになります）';
     volTextEl.textContent = settings.vol;
     volEl.value = settings.vol;
+    var hasSound = !!soundBuf;
+    $('modeBeep').checked = settings.mode !== 'custom';
+    $('modeCustom').checked = settings.mode === 'custom';
+    $('modeCustom').disabled = !hasSound;
+    $('modeCustomLabel').classList.toggle('disabled', !hasSound);
+    $('fileName').textContent = hasSound
+      ? '選んだファイル：' + soundName + '（' + (Math.round(soundBuf.duration * 10) / 10) + '秒）'
+      : (soundLoading ? '読み込み中です…' : 'ファイルは選ばれていません');
+    $('del').disabled = !hasSound;
+    $('del').style.opacity = hasSound ? '1' : '.4';
+    $('len').value = settings.len;
+    $('soundMsg').textContent = soundMsg;
   }
 
   // ---- 操作 ----
@@ -248,7 +426,7 @@
   }, true);
   testEl.addEventListener('click', function () {
     unlockAudio().then(function (ok) {
-      if (ok) scheduleBeeps(ctx.currentTime + 0.03);
+      if (ok) playAlarm(ctx.currentTime + 0.03);
       else statusEl.textContent = 'この環境では音を出せませんでした';
       refreshUI();
     });
@@ -260,7 +438,16 @@
   });
   // ボリューム調整を離したら確認音
   volEl.addEventListener('change', function () {
-    unlockAudio().then(function (ok) { if (ok) scheduleBeeps(ctx.currentTime + 0.03); });
+    unlockAudio().then(function (ok) { if (ok) playAlarm(ctx.currentTime + 0.03, 2); });
+  });
+  $('modeBeep').addEventListener('change', function () { if (this.checked) { settings.mode = 'beep'; soundMsg = ''; save(); refreshUI(); } });
+  $('modeCustom').addEventListener('change', function () { if (this.checked && soundBuf) { settings.mode = 'custom'; soundMsg = ''; save(); refreshUI(); } });
+  $('pick').addEventListener('click', function () { $('file').click(); });
+  $('file').addEventListener('change', function () { var f = this.files && this.files[0]; onFileChosen(f); this.value = ''; });
+  $('del').addEventListener('click', clearSound);
+  $('len').addEventListener('change', function () {
+    settings.len = this.value; save();
+    unlockAudio().then(function (ok) { if (ok) playAlarm(ctx.currentTime + 0.03); });
   });
   document.addEventListener('visibilitychange', function () { tick(); });
 
@@ -268,6 +455,7 @@
   getCtx();           // 作成だけ（クリックされるまで suspended のことが多い）
   armFromNow();
   refreshUI();
+  loadSavedSound();
   tick();
   setInterval(tick, 250);
 })();
