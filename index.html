@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5分足アラーム</title>
+<style>
+  :root { --bg:#fff8ee; --card:#ffffff; --ink:#4a3b2a; --sub:#8a7560; --on:#2e9e5b; --off:#b9aa98; --accent:#f08a24; --line:#f0e2cf; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:"Meiryo","Yu Gothic UI","Hiragino Sans",sans-serif; display:flex; justify-content:center; padding:24px 16px; }
+  main { width:100%; max-width:560px; }
+  h1 { font-size:28px; text-align:center; margin:0 0 16px; letter-spacing:.05em; }
+  .card { background:var(--card); border:2px solid var(--line); border-radius:20px; padding:20px; margin-bottom:16px; text-align:center; box-shadow:0 3px 10px rgba(180,130,60,.08); }
+  .label { font-size:18px; color:var(--sub); margin-bottom:4px; }
+  .clock { font-size:64px; font-weight:bold; font-variant-numeric:tabular-nums; line-height:1.15; }
+  .count { font-size:48px; font-weight:bold; color:var(--accent); font-variant-numeric:tabular-nums; }
+  .next { font-size:22px; color:var(--sub); margin-top:2px; }
+  .last { font-size:32px; font-weight:bold; font-variant-numeric:tabular-nums; }
+  #toggle { width:100%; border:none; border-radius:24px; padding:26px 12px; font-size:44px; font-weight:bold; color:#fff; cursor:pointer; background:var(--off); font-family:inherit; transition:background .2s; }
+  #toggle.on { background:var(--on); }
+  #toggle:focus-visible, button:focus-visible { outline:4px solid #7ab8ff; outline-offset:3px; }
+  .status { font-size:20px; margin-top:12px; min-height:1.5em; color:var(--sub); }
+  #unlock { display:none; width:100%; border:3px dashed var(--accent); background:#fff1de; color:#b45f0b; border-radius:18px; padding:18px; font-size:26px; font-weight:bold; cursor:pointer; margin-bottom:16px; font-family:inherit; }
+  #unlock.show { display:block; }
+  .row { display:flex; align-items:center; gap:12px; justify-content:center; flex-wrap:wrap; }
+  button.sub { font-size:24px; padding:14px 26px; border-radius:16px; border:2px solid var(--accent); background:#fff; color:#b45f0b; cursor:pointer; font-weight:bold; font-family:inherit; }
+  button.sub:active { background:#fff1de; }
+  input[type=range] { width:220px; height:32px; accent-color:var(--accent); }
+  .vol { font-size:22px; }
+  .note { font-size:17px; color:var(--sub); text-align:center; line-height:1.7; }
+  .flash { animation:flash .9s ease-out; }
+  @keyframes flash { 0%{background:#ffe0a8} 100%{background:var(--card)} }
+</style>
+</head>
+<body>
+<main>
+  <h1>⏰ 5分足アラーム</h1>
+
+  <button id="unlock" type="button">👆 クリックして開始（音を出す準備）</button>
+
+  <div class="card">
+    <div class="label">いまの時刻</div>
+    <div class="clock" id="clock">--:--:--</div>
+  </div>
+
+  <div class="card" id="nextCard">
+    <div class="label">次のアラームまで</div>
+    <div class="count" id="count">--:--</div>
+    <div class="next">次は <span id="nextAt">--:--</span></div>
+  </div>
+
+  <div class="card" id="lastCard">
+    <div class="label">前回のアラーム</div>
+    <div class="last" id="last">まだ鳴っていません</div>
+  </div>
+
+  <div class="card">
+    <button id="toggle" type="button" aria-pressed="false">OFF</button>
+    <div class="status" id="status"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button class="sub" id="test" type="button">🔔 テスト音</button>
+      <label class="vol">音量 <input id="vol" type="range" min="0" max="100" step="5" value="80"> <span id="volText">80</span>%</label>
+    </div>
+  </div>
+
+  <p class="note">ONの間、毎時 0分・5分・10分 … 55分（5分足が更新されるとき）に「ピピピ」と鳴って、自動で止まります。<br>
+  このタブを開いたままにしてください（別のタブやウィンドウの裏でも鳴ります）。</p>
+</main>
+
+<script>
+(function () {
+  'use strict';
+  var KEY = 'alarm5m-v1';
+  var SLOT_MS = 5 * 60 * 1000;
+  var LEAD_MS = 1500;      // この時間以内に境界が来たら、音を先に予約する
+  var LATE_MAX_MS = 60000; // 境界から60秒以内の遅れなら遅れて鳴らす（それ以上は鳴らさない）
+
+  var $ = function (id) { return document.getElementById(id); };
+  var clockEl = $('clock'), countEl = $('count'), nextAtEl = $('nextAt'), lastEl = $('last');
+  var toggleEl = $('toggle'), statusEl = $('status'), unlockEl = $('unlock');
+  var volEl = $('vol'), volTextEl = $('volText'), testEl = $('test');
+
+  // ---- 設定の保存・読み込み ----
+  var settings = { on: false, vol: 80 };
+  try {
+    var saved = JSON.parse(localStorage.getItem(KEY) || 'null');
+    if (saved) {
+      settings.on = !!saved.on;
+      if (typeof saved.vol === 'number' && saved.vol >= 0 && saved.vol <= 100) settings.vol = saved.vol;
+    }
+  } catch (e) {}
+  function save() { try { localStorage.setItem(KEY, JSON.stringify(settings)); } catch (e) {} }
+
+  // ---- 音（Web Audio API）----
+  var ctx = null;
+  function getCtx() {
+    if (!ctx) {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      ctx = new AC();
+      ctx.onstatechange = refreshUI;
+    }
+    return ctx;
+  }
+  function audioReady() { return !!ctx && ctx.state === 'running'; }
+  function unlockAudio() {
+    var c = getCtx();
+    if (!c) return Promise.resolve(false);
+    if (c.state === 'running') return Promise.resolve(true);
+    return c.resume().then(function () { return c.state === 'running'; }, function () { return false; });
+  }
+
+  // ピピピ = 短いビープ3回。startAt は AudioContext の時刻（秒）
+  function scheduleBeeps(startAt) {
+    var c = ctx;
+    var gainValue = Math.pow(settings.vol / 100, 1.5) * 0.9;
+    if (gainValue <= 0) return;
+    var BEEP = 0.12, GAP = 0.10, FREQ = 1100;
+    for (var i = 0; i < 3; i++) {
+      var t0 = startAt + i * (BEEP + GAP);
+      var osc = c.createOscillator();
+      var g = c.createGain();
+      osc.type = 'square';
+      osc.frequency.value = FREQ;
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.linearRampToValueAtTime(gainValue * 0.5, t0 + 0.008);
+      g.gain.setValueAtTime(gainValue * 0.5, t0 + BEEP - 0.012);
+      g.gain.linearRampToValueAtTime(0.0001, t0 + BEEP);
+      osc.connect(g); g.connect(c.destination);
+      osc.start(t0);
+      osc.stop(t0 + BEEP + 0.02);   // 自動で止まる
+    }
+  }
+
+  // ---- 時刻ユーティリティ（PCのローカル時刻）----
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  function hms(d) { return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()); }
+  function hm(d) { return pad(d.getHours()) + ':' + pad(d.getMinutes()); }
+  // 次の5分境界（ローカル時刻の :00 :05 ... :55）の epoch ms
+  function nextBoundary(nowMs) {
+    var d = new Date(nowMs);
+    d.setSeconds(0, 0);
+    var m = d.getMinutes();
+    d.setMinutes(m - (m % 5) + 5);
+    return d.getTime();
+  }
+  function slotId(boundaryMs) { return String(boundaryMs); }
+
+  // ---- 状態 ----
+  var lastHandled = null;    // 最後に処理（予約または鳴動）した境界のID
+  var scheduledFor = null;   // 先行予約済みの境界のID
+  var lastRungMs = null;     // 前回鳴った境界の時刻
+  window.__alarm5m = { rings: 0, scheduled: 0, log: [] }; // 動作確認用
+
+  function ring(boundaryMs, startAt) {
+    scheduleBeeps(startAt);
+    window.__alarm5m.rings++;
+    window.__alarm5m.log.push(boundaryMs);
+  }
+
+  function armFromNow() {
+    // ONにした直後・読み込み直後：いま過ぎた境界では鳴らさない
+    var n = Date.now();
+    lastHandled = slotId(nextBoundary(n) - SLOT_MS);
+    scheduledFor = null;
+  }
+
+  function tick() {
+    var now = Date.now();
+    var d = new Date(now);
+    clockEl.textContent = hms(d);
+
+    var nb = nextBoundary(now);
+    var remain = nb - now;
+    var rs = Math.ceil(remain / 1000);
+    countEl.textContent = pad(Math.floor(rs / 60)) + ':' + pad(rs % 60);
+    nextAtEl.textContent = hm(new Date(nb));
+
+    if (settings.on && audioReady()) {
+      var cur = slotId(nb - SLOT_MS); // いま直前に過ぎた境界
+      var curMs = nb - SLOT_MS;
+      // ① 境界を過ぎたのに未処理 → すぐ鳴らす（タイマーが遅れたとき）
+      if (cur !== lastHandled && cur !== scheduledFor && now - curMs <= LATE_MAX_MS) {
+        ring(curMs, ctx.currentTime + 0.02);
+        lastHandled = cur; lastRungMs = curMs; flashLast();
+      } else if (cur !== lastHandled && scheduledFor !== cur) {
+        lastHandled = cur; // 遅れすぎ（PCスリープ復帰など）は鳴らさない
+      }
+      // ② 境界の直前 → AudioContextの正確な時刻で先に予約
+      var nid = slotId(nb);
+      if (remain <= LEAD_MS && scheduledFor !== nid && lastHandled !== nid) {
+        ring(nb, ctx.currentTime + remain / 1000);
+        scheduledFor = nid; window.__alarm5m.scheduled++;
+        pendingRing = { id: nid, ms: nb };
+      }
+    }
+    // 予約した境界を過ぎたら「前回」表示と処理済みに反映
+    if (pendingRing && now >= pendingRing.ms) {
+      lastHandled = pendingRing.id; lastRungMs = pendingRing.ms;
+      pendingRing = null; flashLast();
+    }
+    if (lastRungMs !== null) lastEl.textContent = hm(new Date(lastRungMs)) + ' に鳴りました';
+  }
+  var pendingRing = null;
+
+  function flashLast() {
+    var c = $('lastCard');
+    c.classList.remove('flash'); void c.offsetWidth; c.classList.add('flash');
+  }
+
+  // ---- 画面更新 ----
+  function refreshUI() {
+    toggleEl.textContent = settings.on ? 'ON' : 'OFF';
+    toggleEl.classList.toggle('on', settings.on);
+    toggleEl.setAttribute('aria-pressed', settings.on ? 'true' : 'false');
+    var needUnlock = settings.on && !audioReady();
+    unlockEl.classList.toggle('show', needUnlock);
+    if (!settings.on) statusEl.textContent = 'アラームは止まっています（押すとONになります）';
+    else if (needUnlock) statusEl.textContent = '音の準備がまだです。上のボタンをクリックしてください';
+    else statusEl.textContent = '5分ごとに鳴ります（押すとOFFになります）';
+    volTextEl.textContent = settings.vol;
+    volEl.value = settings.vol;
+  }
+
+  // ---- 操作 ----
+  toggleEl.addEventListener('click', function () {
+    settings.on = !settings.on;
+    save();
+    if (settings.on) {
+      armFromNow();
+      pendingRing = null;
+      refreshUI();
+      unlockAudio().then(function () { armFromNow(); refreshUI(); });
+    } else {
+      pendingRing = null; scheduledFor = null;
+      refreshUI();
+    }
+  });
+  unlockEl.addEventListener('click', function () {
+    unlockAudio().then(function () { armFromNow(); refreshUI(); });
+  });
+  // どこをクリックしても音の準備ができるように
+  document.addEventListener('pointerdown', function () {
+    if (settings.on && !audioReady()) unlockAudio().then(function (ok) { if (ok) { armFromNow(); } refreshUI(); });
+  }, true);
+  testEl.addEventListener('click', function () {
+    unlockAudio().then(function (ok) {
+      if (ok) scheduleBeeps(ctx.currentTime + 0.03);
+      else statusEl.textContent = 'この環境では音を出せませんでした';
+      refreshUI();
+    });
+  });
+  volEl.addEventListener('input', function () {
+    settings.vol = parseInt(volEl.value, 10) || 0;
+    volTextEl.textContent = settings.vol;
+    save();
+  });
+  // ボリューム調整を離したら確認音
+  volEl.addEventListener('change', function () {
+    unlockAudio().then(function (ok) { if (ok) scheduleBeeps(ctx.currentTime + 0.03); });
+  });
+  document.addEventListener('visibilitychange', function () { tick(); });
+
+  // ---- 開始 ----
+  getCtx();           // 作成だけ（クリックされるまで suspended のことが多い）
+  armFromNow();
+  refreshUI();
+  tick();
+  setInterval(tick, 250);
+})();
+</script>
+</body>
+</html>
