@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>5分足アラーム</title>
+<link rel="icon" href="data:,">
 <style>
   :root { --bg:#fff8ee; --card:#ffffff; --ink:#4a3b2a; --sub:#8a7560; --on:#2e9e5b; --off:#b9aa98; --accent:#f08a24; --line:#f0e2cf; }
   * { box-sizing:border-box; }
@@ -77,7 +78,8 @@
 
   <div class="card" id="soundCard">
     <div class="sec-title">🎵 音の選択</div>
-    <label class="opt"><input type="radio" name="mode" id="modeBeep" value="beep"> ピピピ（標準）</label>
+    <label class="opt" id="modeBuiltinLabel"><input type="radio" name="mode" id="modeBuiltin" value="builtin"> オリジナル警告音（標準）</label>
+    <label class="opt"><input type="radio" name="mode" id="modeBeep" value="beep"> ピピピ</label>
     <label class="opt" id="modeCustomLabel"><input type="radio" name="mode" id="modeCustom" value="custom"> 自分の音声ファイル</label>
     <div class="fileline" id="fileName">ファイルは選ばれていません</div>
     <div class="row">
@@ -96,10 +98,10 @@
     <div class="msg" id="soundMsg"></div>
     <div class="help">効果音ラボなどで好きな音をダウンロードして、ここで選んでください（<a href="https://soundeffect-lab.info/" target="_blank" rel="noopener noreferrer">効果音ラボ</a>）。<br>
     選んだファイルは、この端末のブラウザの中にだけ保存されます（どこにもアップロードされません）。<br>
-    「鳴らす長さ」は、ピピピ以外の音にだけ使われます。長い音は、その長さで自動的に小さくなって止まります。</div>
+    「鳴らす長さ」は、ピピピ以外の音にだけ使われます。長い音は、その長さで自動的に小さくなって止まり、短い音は最後まで鳴ります。</div>
   </div>
 
-  <p class="note">ONの間、毎時 0分・5分・10分 … 55分（5分足が更新されるとき）に「ピピピ」と鳴って、自動で止まります。<br>
+  <p class="note">ONの間、毎時 0分・5分・10分 … 55分（5分足が更新されるとき）にアラームが鳴って、自動で止まります。<br>
   このタブを開いたままにしてください（別のタブやウィンドウの裏でも鳴ります）。</p>
 </main>
 
@@ -117,13 +119,17 @@
   var volEl = $('vol'), volTextEl = $('volText'), testEl = $('test');
 
   // ---- 設定の保存・読み込み ----
-  var settings = { on: false, vol: 80, mode: 'beep', len: '3' };
+  var settings = { on: false, vol: 80, mode: 'builtin', chosen: false, len: '3' };
   try {
     var saved = JSON.parse(localStorage.getItem(KEY) || 'null');
     if (saved) {
       settings.on = !!saved.on;
       if (typeof saved.vol === 'number' && saved.vol >= 0 && saved.vol <= 100) settings.vol = saved.vol;
-      if (saved.mode === 'custom') settings.mode = 'custom';
+      // 音を自分で選んだことがある場合だけ、保存した選択を使う（それ以外は標準のオリジナル警告音）
+      if (saved.chosen === true || saved.mode === 'custom') {
+        settings.chosen = true;
+        if (saved.mode === 'custom' || saved.mode === 'beep' || saved.mode === 'builtin') settings.mode = saved.mode;
+      }
       if (['1','2','3','5','10','full'].indexOf(String(saved.len)) >= 0) settings.len = String(saved.len);
     }
   } catch (e) {}
@@ -177,6 +183,28 @@
   var soundName = '';
   var soundMsg = '';
   var soundLoading = false;
+  var builtinBuf = null;    // 標準の「オリジナル警告音」（alert.mp3 を読み込んでデコード済み）
+  var BUILTIN_URL = 'alert.mp3';
+  var CACHE_NAME = 'alarm5m-v1';
+  // 取得できたらブラウザのキャッシュに保存し、オフラインのときはそれを使う
+  function fetchBuiltin() {
+    return fetch(BUILTIN_URL, { cache: 'no-cache' }).then(function (r) {
+      if (!r.ok) throw new Error('http ' + r.status);
+      if (window.caches) { var c = r.clone(); caches.open(CACHE_NAME).then(function (cache) { return cache.put(BUILTIN_URL, c); }).catch(function () {}); }
+      return r.arrayBuffer();
+    }).catch(function (e) {
+      if (!window.caches) throw e;
+      return caches.match(BUILTIN_URL).then(function (m) { if (!m) throw e; return m.arrayBuffer(); });
+    });
+  }
+  function loadBuiltin() {
+    return fetchBuiltin().then(decode).then(function (buf) {
+      builtinBuf = buf; window.__alarm5m.builtinDuration = buf.duration;
+    }).catch(function () {
+      builtinBuf = null;
+      if (settings.mode === 'builtin') soundMsg = 'オリジナル警告音を読み込めませんでした。ピピピを使います';
+    }).then(refreshUI);
+  }
 
   function openDB() {
     return new Promise(function (resolve, reject) {
@@ -219,12 +247,12 @@
       return decode(rec.data).then(function (buf) { soundBuf = buf; soundName = rec.name || '音声ファイル'; return buf; });
     }).catch(function () {
       soundBuf = null; soundName = '';
-      if (settings.mode === 'custom') soundMsg = '保存した音声を読み込めませんでした。標準のピピピを使います';
+      if (settings.mode === 'custom') soundMsg = '保存した音声を読み込めませんでした。標準のオリジナル警告音を使います';
     }).then(function () {
       soundLoading = false;
       if (settings.mode === 'custom' && !soundBuf) {
-        if (!soundMsg) soundMsg = '音声ファイルが見つかりません。標準のピピピを使います';
-        settings.mode = 'beep'; save();
+        if (!soundMsg) soundMsg = '音声ファイルが見つかりません。標準のオリジナル警告音を使います';
+        settings.mode = builtinBuf ? 'builtin' : 'beep'; save();
       }
       refreshUI();
     });
@@ -241,7 +269,7 @@
       var data = reader.result;
       decode(data).then(function (buf) {
         soundBuf = buf; soundName = file.name;
-        settings.mode = 'custom'; save();
+        settings.mode = 'custom'; settings.chosen = true; save();
         soundMsg = '';
         return idbPut({ name: file.name, type: file.type, data: data }).then(function () {
           soundMsg = '「テスト音」ボタンで確認できます';
@@ -256,8 +284,8 @@
   }
 
   function clearSound() {
-    soundBuf = null; soundName = ''; settings.mode = 'beep'; save();
-    soundMsg = '標準のピピピに戻しました';
+    soundBuf = null; soundName = ''; settings.mode = 'builtin'; settings.chosen = true; save();
+    soundMsg = '標準のオリジナル警告音に戻しました';
     idbDel().catch(function () {}).then(refreshUI);
   }
 
@@ -267,19 +295,22 @@
   }
 
   // 自分の音声を再生（長い場合は指定の長さで、短い減衰をつけて止める）
-  function scheduleSound(startAt, maxSec) {
+  function scheduleSound(startAt, maxSec, buf) {
     var c = ctx;
     var gainValue = Math.pow(settings.vol / 100, 1.5) * 0.9;
     if (gainValue <= 0) return 0;
-    var dur = customDuration(soundBuf);
+    var dur = customDuration(buf);
     if (maxSec) dur = Math.min(dur, maxSec);
+    var trimmed = dur < buf.duration - 0.01;
     var fade = Math.min(0.3, dur * 0.4);
     var src = c.createBufferSource();
     var g = c.createGain();
-    src.buffer = soundBuf;
+    src.buffer = buf;
     g.gain.setValueAtTime(gainValue, startAt);
-    g.gain.setValueAtTime(gainValue, startAt + dur - fade);
-    g.gain.linearRampToValueAtTime(0.0001, startAt + dur);
+    if (trimmed) {   // 途中で切るときだけ、短く小さくして止める
+      g.gain.setValueAtTime(gainValue, startAt + dur - fade);
+      g.gain.linearRampToValueAtTime(0.0001, startAt + dur);
+    }
     src.connect(g); g.connect(c.destination);
     src.start(startAt);
     src.stop(startAt + dur + 0.02);   // 自動で止まる
@@ -289,12 +320,13 @@
   // 選択中の音を鳴らす（失敗したら標準のピピピ）
   function playAlarm(startAt, maxSec) {
     var info = { kind: 'beep', startAt: startAt, dur: 0 };
-    if (settings.mode === 'custom') {
-      if (soundBuf) {
-        try { info.dur = scheduleSound(startAt, maxSec); info.kind = 'custom'; }
+    if (settings.mode === 'custom' || settings.mode === 'builtin') {
+      var buf = settings.mode === 'custom' ? soundBuf : builtinBuf;
+      if (buf) {
+        try { info.dur = scheduleSound(startAt, maxSec, buf); info.kind = settings.mode; }
         catch (e) { soundMsg = '音声を鳴らせなかったため、ピピピにしました'; refreshUI(); }
       } else {
-        soundMsg = '音声ファイルが使えないため、ピピピにしました'; refreshUI();
+        soundMsg = '音声が使えないため、ピピピにしました'; refreshUI();
       }
     }
     if (info.kind === 'beep') scheduleBeeps(startAt);
@@ -390,7 +422,10 @@
     volTextEl.textContent = settings.vol;
     volEl.value = settings.vol;
     var hasSound = !!soundBuf;
-    $('modeBeep').checked = settings.mode !== 'custom';
+    $('modeBuiltin').checked = settings.mode === 'builtin';
+    $('modeBuiltin').disabled = !builtinBuf;
+    $('modeBuiltinLabel').classList.toggle('disabled', !builtinBuf);
+    $('modeBeep').checked = settings.mode === 'beep';
     $('modeCustom').checked = settings.mode === 'custom';
     $('modeCustom').disabled = !hasSound;
     $('modeCustomLabel').classList.toggle('disabled', !hasSound);
@@ -440,8 +475,9 @@
   volEl.addEventListener('change', function () {
     unlockAudio().then(function (ok) { if (ok) playAlarm(ctx.currentTime + 0.03, 2); });
   });
-  $('modeBeep').addEventListener('change', function () { if (this.checked) { settings.mode = 'beep'; soundMsg = ''; save(); refreshUI(); } });
-  $('modeCustom').addEventListener('change', function () { if (this.checked && soundBuf) { settings.mode = 'custom'; soundMsg = ''; save(); refreshUI(); } });
+  $('modeBuiltin').addEventListener('change', function () { if (this.checked && builtinBuf) { settings.mode = 'builtin'; settings.chosen = true; soundMsg = ''; save(); refreshUI(); } });
+  $('modeBeep').addEventListener('change', function () { if (this.checked) { settings.mode = 'beep'; settings.chosen = true; soundMsg = ''; save(); refreshUI(); } });
+  $('modeCustom').addEventListener('change', function () { if (this.checked && soundBuf) { settings.mode = 'custom'; settings.chosen = true; soundMsg = ''; save(); refreshUI(); } });
   $('pick').addEventListener('click', function () { $('file').click(); });
   $('file').addEventListener('change', function () { var f = this.files && this.files[0]; onFileChosen(f); this.value = ''; });
   $('del').addEventListener('click', clearSound);
@@ -455,7 +491,7 @@
   getCtx();           // 作成だけ（クリックされるまで suspended のことが多い）
   armFromNow();
   refreshUI();
-  loadSavedSound();
+  loadBuiltin().then(loadSavedSound);
   tick();
   setInterval(tick, 250);
 })();
